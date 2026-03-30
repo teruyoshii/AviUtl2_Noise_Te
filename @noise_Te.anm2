@@ -1,0 +1,616 @@
+@パーリンノイズ
+--information:パーリンノイズ@noise_Te v1.0 by teruyoshi | 指定されたオブジェクトにx,y,tでループ可能(シームレス)なパーリンノイズを適用します
+--group:基本設定,true
+--track@str:強さ,0,100,100,0.01
+--track@velocityX:速度X,-800,800,0,0.01
+--track@velocityY:速度Y,-800,800,0,0.01
+--track@changeRate:変化速度,0,800,1,0.01
+--track@divX:分割数X,0,2000,5,1
+--track@divY:分割数Y,0,2000,5,1
+--track@divT:分割数T,0,2000,5,1
+--track@threshold:しきい値,0,100,0,0.01
+--group:ループ設定,true
+-- 各ループ幅/時間は、0にするとループしません
+--track@loopX:ループ幅X,0,2000,500,0.01,オブジェクトの幅
+--track@loopY:ループ幅Y,0,2000,500,0.01,オブジェクトの高さ
+--track@loopT:ループ時間,0,2000,0,0.01,オブジェクトの総時間
+--check@showLoopFields:ループ範囲を表示,0
+--group:その他の設定,false
+--track@seed:シード,0,10000,0,1
+--select@blendMode:合成モード,アルファ値と乗算=0,明るさと乗算=1
+--select@velocityMode:速度の指定法,速度を指定する=0,その時点の位置を指定する=1
+--check@showAnchor:アンカーを表示,1
+
+--filter
+
+--[[pixelshader@drawLoopFields:
+  cbuffer constant0 : register(b0) {
+    float loopX;
+    float loopY;
+    float loopT;
+    float changedT;
+    float objWidth;
+    float objHeight;
+  };
+  SamplerState samLinear : register(s0);
+  struct PS_INPUT {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+  };
+
+  float4 drawLoopFields(PS_INPUT input) : SV_Target {
+    // float2 uv = fmod(input.pos.xy, float2(loopX, loopY))/float2(loopX,loopY);
+    float u = loopX == 0 ? input.pos.x/objWidth : fmod(input.pos.x, loopX)/loopX;
+    float v = loopY == 0 ? input.pos.y/objHeight : fmod(input.pos.y, loopY)/loopY;
+    float t = loopT == 0 ? 0 : fmod(changedT, loopT)/loopT;
+    return float4(u, v, t, 1.0);
+  }
+]]
+
+--[[pixelshader@perlinNoise:
+  Texture2D tex : register(t0);
+  cbuffer constant0 : register(b0) {
+    float str;
+    float movedX;
+    float movedY;
+    float changedT;
+    float divX;
+    float divY;
+    float divT;
+    float threshold;
+    float loopX;
+    float loopY;
+    float loopT;
+    float seed;
+    float blendMode;
+    float objWidth;
+    float objHeight;
+  };
+  SamplerState samLinear : register(s0);
+  struct PS_INPUT {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+  };
+
+  float mod ( float x, float y ) {
+    return x - y * floor(x / y);
+  }
+  // パーリンノイズの乱数テーブル
+  float ibukiHash(uint4 u) { 
+    // posとseedをもとに、0〜1の疑似乱数を生成
+    // uが負の場合はもとの値に0xFFFFFFFFを足して正の値にする
+    const uint4 mult = uint4(0xae3cc725, 0x9fe72885, 0xae36bfb5, 0x82c1fcad);  
+    u = u * mult;  
+    u ^= u.wxyz ^ u >> 13;  
+    uint r = dot(u, mult);  
+    r ^= r >> 11;  
+    r = (r * r) ^ r;  
+    return r * 2.3283064365386962890625e-10;  
+  }
+  float fade(float t) {
+    return t * t * t * (t * (t * 6 - 15) + 10);
+  }
+  float lerp(float t, float a, float b){
+    return a + t * (b - a);
+  }
+  float grad(float hash, float x, float y, float z){
+    int h = ((int)(hash*16))&0xF; //hash*16を16で割った余りで勾配ベクトルを決定
+    switch (h) {
+      case 0x0: return x + y;
+      case 0x1: return -x + y;
+      case 0x2: return x - y;
+      case 0x3: return -x - y;
+      case 0x4: return x + z;
+      case 0x5: return -x + z;
+      case 0x6: return x - z;
+      case 0x7: return -x - z;
+      case 0x8: return y + z;
+      case 0x9: return -y + z;
+      case 0xA: return y - z;
+      case 0xB: return -y - z;
+      case 0xC: return y + x;
+      case 0xD: return -y + z;
+      case 0xE: return y - x;
+      case 0xF: return -y - z;
+      default: return 0; // 発生しない
+    }
+  }
+  float noise(float3 p) {
+    int3 Pi = floor(p);
+    int3 succPi = floor(float3(mod(Pi.x+1, divX), mod(Pi.y+1, divY), mod((Pi.z+1), divT))); // ループさせるために、整数座標の次の点をループ幅で割った余りにする
+    float3 Pf = float3(p-Pi); // 小数部分
+    float3 Pfm1 = Pf - 1.0;
+    float3 fadePf = float3(fade(Pf.x), fade(Pf.y), fade(Pf.z));
+    uint s = (uint)seed;
+    float A = ibukiHash(uint4(Pi.x    , Pi.y    , Pi.z    , s));
+    float B = ibukiHash(uint4(succPi.x, Pi.y    , Pi.z    , s));
+    float C = ibukiHash(uint4(Pi.x    , succPi.y, Pi.z    , s));
+    float D = ibukiHash(uint4(succPi.x, succPi.y, Pi.z    , s));
+    float E = ibukiHash(uint4(Pi.x    , Pi.y    , succPi.z, s));
+    float F = ibukiHash(uint4(succPi.x, Pi.y    , succPi.z, s));
+    float G = ibukiHash(uint4(Pi.x    , succPi.y, succPi.z, s));
+    float H = ibukiHash(uint4(succPi.x, succPi.y, succPi.z, s));
+
+    float AB = lerp(fadePf.x, grad(A, Pf.x, Pf.y, Pf.z), 
+                              grad(B, Pfm1.x, Pf.y, Pf.z));
+    float CD = lerp(fadePf.x, grad(C, Pf.x, Pfm1.y, Pf.z), 
+                              grad(D, Pfm1.x, Pfm1.y, Pf.z));
+    float EF = lerp(fadePf.x, grad(E, Pf.x, Pf.y, Pfm1.z), 
+                              grad(F, Pfm1.x, Pf.y, Pfm1.z));
+    float GH = lerp(fadePf.x, grad(G, Pf.x, Pfm1.y, Pfm1.z), 
+                              grad(H, Pfm1.x, Pfm1.y, Pfm1.z));
+    float ABCD = lerp(fadePf.y, AB, CD);
+    float EFGH = lerp(fadePf.y, EF, GH);
+    return (lerp(fadePf.z, ABCD, EFGH)+1.0)/2.0; // 結果を0〜1に正規化
+  }
+
+  float4 perlinNoise(PS_INPUT input) : SV_Target {
+    float u = frac((input.pos.x + movedX)/loopX)*divX; // 0~divXの範囲でループさせる mod(input.pos.x + movedX, loopX) / loopX * divX と同じ意味
+    float v = frac((input.pos.y + movedY)/loopY)*divY;
+    float t = frac(changedT/loopT)*divT;
+    float n = noise(float3(u, v, t));
+    n = n > threshold ? n : 0.0; // 閾値以下を0にする
+    float4 original = tex.Sample(samLinear, input.uv);
+    float mix = n * str + (1 - str);
+    return float4(original.rgb * mix, blendMode == 1 ? original.a : original.a * mix); // 明るさと乗算 or アルファ値と乗算
+  }
+
+]]
+
+local movedX, movedY, changedT
+if changeRate == 0 then 
+  changeRate = 0.001
+  divT = 0
+end
+if loopX == 0 then loopX = obj.w end
+if loopY == 0 then loopY = obj.h end
+if loopT == 0 then
+  loopT = (obj.totaltime + 1 / obj.framerate) -- ループ時間が0のときはオブジェクトの総時間を使う(1フレーム分長くして連結時にカクつかないようにする)
+end
+if velocityMode == 0 then -- 速度を指定する
+  movedX = velocityX*obj.time
+  movedY = velocityY*obj.time;
+  changedT = changeRate*obj.time;
+  loopT = loopT * changeRate; -- ループ時間も変化速度に合わせて変化させる
+  if showAnchor == 1 then
+    obj.setanchor("velocityX,velocityY,changeRate", 0, "star", "xyz")
+  end
+else -- その時点の位置を指定する
+  movedX = velocityX
+  movedY = velocityY
+  changedT = changeRate;
+  if showAnchor == 1 then
+    obj.setanchor("velocityX,velocityY,changeRate", 0, "line", "xyz")
+  end
+end
+changeRate = 1
+if showLoopFields==1 then
+  obj.pixelshader("drawLoopFields", "object", "object", {
+    loopX,
+    loopY,
+    loopT,
+    changedT,
+    obj.w,
+    obj.h
+  }
+  )
+  obj.draw()
+  return
+end
+local blend = ""
+if blendMode == 1 then
+  blend = "draw"
+else
+  blend = "mask"
+end
+
+obj.pixelshader("perlinNoise", "object", "object", {
+  str/100.0,
+  movedX,
+  movedY,
+  changedT,
+  divX,
+  divY,
+  divT,
+  threshold/100,
+  loopX,
+  loopY,
+  loopT,
+  seed,
+  blendMode,
+  obj.w,
+  obj.h
+}, blend
+)
+
+@フラクタルノイズ
+--information:フラクタルノイズ@noise_Te v1.0 by teruyoshi | 指定されたオブジェクトにループ可能(シームレス)なフラクタルノイズを適用します
+--group:基本設定,true
+--track@initialStr:強さ,0,100,100,1
+--track@velocityX:速度X,-800,800,0,0.01
+--track@velocityY:速度Y,-800,800,0,0.01
+--track@changeRate:変化速度,0,800,1,0.01
+--track@initialX:分割数X,0,100,2,1
+--track@initialY:分割数Y,0,100,2,1
+--track@initialT:分割数T,0,2000,5,1
+--track@threshold:閾値,0,100,0,0.01
+--group:フラクタル設定,true
+--track@depth:オクターブ数,1,10,4,1
+--track@nextSize:次の分割数係数,2,10,2,1
+--track@nextStr:次の強さ係数,0,1,0.7,0.01
+--group:ループ設定,true
+--track@loopX:ループ幅X,0,2000,500,0.01,オブジェクトの幅
+--track@loopY:ループ幅Y,0,2000,500,0.01,オブジェクトの高さ
+--track@loopT:ループ時間,0,2000,0,0.01,オブジェクトの総時間
+--group:その他の設定,false
+--track@seed:シード,0,10000,0,1
+--track0:🕒️トーンカーブ,0,100,0,0.01 --時間制御でグラデーションの遷移を制御する
+--select@blendNum:合成モード=14,通常=0,加算=1,減算=2,乗算=3,スクリーン=4,オーバーレイ=5,RGB比較(明)=6,RGB比較(暗)=7,焼き込みリニア=8,リニアライト=9,差の絶対値=10,覆い焼きカラー=11,焼き込みカラー=12,ハードライト=13,ソフトライト=14,除外=15,除算=16,ビビッドライト=17,ピンライト=18,ハードミックス=19
+--select@velocityMode:速度の指定法,速度を指定する=0,その時点の位置を指定する=1
+--check@showAnchor:アンカーを表示,1
+
+--filter
+
+local MaxResolution = 255 -- グラデーションカーブの解像度
+-- 重い場合はMaxResolutionを下げてください(下のシェーダー側のMaxResolutionも同じ値にしてください)
+local blendModes = {"normal","add", "subtract", "multiply", "screen", "overlay", "lighten", "darken", "linear_burn", "linear_light", "abs_difference", "color_dodge", "color_burn", "hard_light", "soft_light", "exclude", "divide", "vivid_light", "pin_light", "hard_mix"}
+
+--ｸﾞﾗﾃﾞ曲線からLUTを作成
+local gCurves = {}
+if obj.getoption("track_mode", "0") ~= 0 then -- 時間制御が設定されていない場合は直線移動とみなす
+  for i = 0, MaxResolution*4 do
+    gCurves[i] = obj.getvalue(0,(obj.totaltime-1/obj.framerate)*i/(MaxResolution*4))/100
+  end
+end
+--[[pixelshader@toneCurve:
+  static const uint MaxResolution = 255; // 上のLua側のMaxresolutionと同じ値にすること
+  Texture2D tex : register(t0);
+  cbuffer constant0 : register(b0) {
+    float gCurve[MaxResolution];
+  };
+  SamplerState samLinear : register(s0);
+  struct PS_INPUT {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+  };
+  float4 toneCurve(PS_INPUT input) : SV_Target {
+    float4 color = tex.Sample(samLinear, input.uv);
+    int r = (int)(color.r * MaxResolution);
+    int g = (int)(color.g * MaxResolution);
+    int b = (int)(color.b * MaxResolution);
+    color.r = gCurve[r];
+    color.g = gCurve[g];
+    color.b = gCurve[b];
+    return color;
+  }
+]]
+
+--  #############################
+--  #######合成モードの定義########
+--  #############################
+--[[pixelshader@normal:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 normal(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    float4 result;
+    result = to + from * (1 - to.a);
+    return result;
+  }
+]]
+--[[pixelshader@add:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 add(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    from.rgb = min(1, from.rgb + to.rgb);
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@subtract:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 subtract(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    from.rgb = max(0, from.rgb - to.rgb);
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@multiply:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 multiply(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb *= pow(max(to.rgb, 1e-10), to.a);
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@screen:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 screen(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = 1 - (1 - from.rgb) * pow(max(1 - to.rgb, 1e-10), to.a);
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@overlay:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 overlay(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    float3 mask = -sign(from.rgb - 0.5);
+    float3 offset = (1 - mask) / 2;
+    from.rgb = offset + (offset + (from.rgb * mask.rgb)) * pow(2 * max((offset + (to.rgb * mask.rgb)), 1e-10), to.a) * mask.rgb;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@lighten:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 lighten(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = from.rgb * (1 - to.a) + max(from.rgb, to.rgb) * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@darken:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 darken(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = from.rgb * (1 - to.a) + min(from.rgb, to.rgb) * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@linear_burn:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 linear_burn(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = from.rgb * (1 - to.a) + max(0, from.rgb + to.rgb - 1) * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@linear_light:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 linear_light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = from.rgb * (1 - to.a) + clamp(from.rgb + 2 * to.rgb - 1, 0, 1) * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@abs_difference:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 abs_difference(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = from.rgb * (1 - to.a) + abs(from.rgb - to.rgb) * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@color_dodge:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 color_dodge(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = min(from.rgb / pow(max(1 - to.rgb, 1e-10), to.a), 1);
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@color_burn:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 color_burn(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = 1 - min(1, (1 - from.rgb) / pow(max(to.rgb, 1e-10), to.a));
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@hard_light:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 hard_light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    float3 mask = -sign(to.rgb - 0.5);
+    float3 offset = (1 - mask) / 2;
+    from.rgb = offset + (offset + (from.rgb * mask.rgb)) * pow(2 * max((offset + (to.rgb * mask.rgb)), 1e-10), to.a) * mask.rgb;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@soft_light:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 soft_light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    float3 sgn = sign(to.rgb - 0.5);
+    float3 mask = (1 + sgn) / 2;
+    float3 d = min(sqrt(from.rgb), ((16 * from.rgb - 12) * from.rgb + 4) * from.rgb);
+    from.rgb += (2 * to.rgb - 1) * to.a * (d * mask - from.rgb * sgn - from.rgb * from.rgb * (1 - mask));
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@exclude:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 exclude(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    from.rgb += to.rgb * (1 - 2 * from.rgb);
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@divide:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 divide(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = min(1, from.rgb / pow(max(to.rgb, 1e-10), to.a));
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@vivid_light:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 vivid_light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    float3 sgn = sign(to.rgb - 0.5);
+    float3 mask = (1 - sgn) / 2;
+    from.rgb = from.rgb * (1 - to.a) + clamp(mask + (from.rgb - mask) / (2 * (1 - mask - sgn * to.rgb)), 0, 1) * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@pin_light:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 pin_light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = from.rgb * (1 - to.a) + clamp(from.rgb, 2 * to.rgb - 1, 2 * to.rgb) * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+--[[pixelshader@hard_mix:
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  SamplerState samp : register(s0);
+  float4 hard_mix(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 from = base.Sample(samp, uv).rgba;
+    float4 to = merge.Sample(samp, uv).rgba;
+    from.rgb /= from.a + 1e-10;
+    to.rgb /= to.a + 1e-10;
+    from.rgb = from.rgb * (1 - to.a) + (1 + sign(from.rgb + to.rgb - 1)) * 0.5 * to.a;
+    from.rgb *= from.a;
+    return from;
+  }
+]]
+
+local divX = initialX
+local divY = initialY
+local str = initialStr
+local velocityModeText
+if velocityMode == 0 then
+  velocityModeText = "速度を指定する"
+else
+  velocityModeText = "その時点の位置を指定する"
+end
+
+if showAnchor == 1 then
+  if velocityMode == 0 then
+    obj.setanchor("velocityX,velocityY,changeRate", 0, "star", "xyz")
+  else
+    obj.setanchor("velocityX,velocityY,changeRate", 0, "line", "xyz")
+  end
+end
+obj.copybuffer("tempbuffer","object")
+for i=1,depth do
+  obj.effect("パーリンノイズ@noise_Te", "強さ",str, "速度X",velocityX, "速度Y",velocityY, "変化速度",changeRate, 
+  "分割数X",divX, "分割数Y",divY, "分割数T",initialT, 
+  "しきい値",threshold, 
+  "ループ幅X",loopX, "ループ幅Y",loopY, "ループ時間",loopT, 
+  "シード",seed, 
+  "合成モード","明るさと乗算", 
+  "速度の指定法",velocityModeText)
+  if obj.getoption("track_mode", "0") ~= 0 then
+    obj.pixelshader("toneCurve", "object", "object", {unpack(gCurves)})
+  end
+  obj.copybuffer("cache:"..i,"object")
+  obj.copybuffer("object","tempbuffer")
+  divX = divX * nextSize
+  divY = divY * nextSize
+  str = str * nextStr
+end
+
+obj.copybuffer("object","cache:1")
+for i=1,depth do
+  obj.copybuffer("tempbuffer","cache:"..i)
+  obj.pixelshader(blendModes[blendNum+1], "object", {"object","tempbuffer"})
+end
