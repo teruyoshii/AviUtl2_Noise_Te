@@ -171,7 +171,7 @@ if velocityMode == 0 then -- 速度を指定する
   movedX = velocityX*obj.time
   movedY = velocityY*obj.time;
   changedT = changeRate*obj.time;
-  loopT = loopT * changeRate; -- ループ時間も変化速度に合わせて変化させる
+  loopT = loopT; -- ループ時間も変化速度に合わせて変化させる
   if showAnchor == 1 then
     obj.setanchor("velocityX,velocityY,changeRate", 0, "star", "xyz")
   end
@@ -614,3 +614,349 @@ for i=1,depth do
   obj.copybuffer("tempbuffer","cache:"..i)
   obj.pixelshader(blendModes[blendNum+1], "object", {"object","tempbuffer"})
 end
+
+@カールノイズ
+--information:カールノイズ@noise_Te v1.0 by teruyoshi | 指定されたオブジェクトにカールノイズ(渦巻き状の流体模様)を適用します
+--group:入力ノイズ,true
+--track@velocityX:速度X,-800,800,0,0.01 -- ノイズの流れる速度X
+--track@velocityY:速度Y,-800,800,0,0.01 -- ノイズの流れる速度Y
+--track@scale:スケール,10,1000,100,0.01 -- ノイズの大きさ
+--track@roundness:球面化率,0,100,0,0.01 -- ノイズの球面化率
+--track@offsetX:位置X,-2000,2000,0,0.01 -- ノイズ場のオフセットX
+--track@offsetY:位置Y,-2000,2000,0,0.01 -- ノイズ場のオフセットY
+--track@rotation:回転,-360,360,0,0.01 -- ノイズ場の回転
+--group:カール生成,true
+--track@t0:初期時間経過,0,100,0,1 -- 0フレーム目時点での時間経過(フレーム数)。
+--track@s0:カール場変化,-1000,1000,0,0.01 -- カール場の変化量
+--track@turbVel:乱流速度,0,800,100,0.01 -- ノイズ場の時間変化速度
+--track@swirl:渦巻き,-360,360,0,0.01 -- カール方向に加える追加回転
+--track@density:複雑度,-100,100,0,0.01 -- ノイズの複雑度
+--track@smoothness:滑らかさ,0,100,50,0.01 -- カール構造の柔らかさ
+--track@bias:バイアス,0,100,50,0.01 -- バイアス:流れの主方向。0=水平、100=垂直、50=均等
+--group:フローオプション,true
+--track@samples:サンプル数,3,24,12,1 -- 流線の蓄積フレーム数(多いほど長く滑らかな筋)
+--track@radius:サンプル半径,0,200,100,0.01 -- 1フレームあたりの変位量倍率(%)
+--track@softness:柔らかさ,0,100,0,0.01 -- 明暗コントラスト
+--track@edgeDef:エッジ,0,100,0,0.01 -- 筋エッジの鋭さ
+--track@flowFalloff:減衰,0,100,0,0.01 -- 場所による明暗のムラ
+--group:その他の設定,true
+--track@seed:シード,0,10000,0,1 -- ノイズのシード値
+
+--filter
+
+--[[pixelshader@curlNoise:
+  Texture2D tex : register(t0);
+  cbuffer constant0 : register(b0) {
+    float objW;
+    float objH;
+    float morphT;        // 乱流速度 * obj.time
+    float driftX;        // 速度方向ベクトル.x * obj.time (ノイズ単位)
+    float driftY;        // 速度方向ベクトル.y * obj.time (ノイズ単位)
+    float scaleN;        // スケール/100
+    float roundness;     // ノイズの球面化率
+    float offsetX;       // 位置X(px)
+    float offsetY;       // 位置Y(px)
+    float rotationRad;   // 回転(rad)
+    float curlRotRad;    // (渦巻き+進化)のラジアン
+    float octaves;       // fBmオクターブ数(濃度から算出, 1〜6)
+    float persistence;   // fBm高周波減衰(滑らかさから算出)
+    float biasX;         // 水平方向curl強度倍率(バイアスから算出)
+    float biasY;         // 垂直方向curl強度倍率
+    float displacement;  // 1フレームあたりの変位量(=0.006*radius/100)
+    float invN;          // 1/サンプル数
+    float softnessGain;  // 柔らかさのコントラスト倍率(1〜4)
+    float edgeDef01;     // エッジ定義(0〜1)
+    float falloffN;      // フロー減衰(0〜1)
+    float seed;          // シード値
+    float s0;            // カール場変化量
+    float isFirstFrame;  // 初回フレームフラグ
+  };
+  SamplerState samLinear : register(s0);
+  struct PS_INPUT {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+  };
+
+  float ibukiHash(uint4 u) {
+    // posとseedをもとに、0〜1の疑似乱数を生成
+    // uが負の場合はもとの値に0xFFFFFFFFを足して正の値にする
+    const uint4 mult = uint4(0xae3cc725, 0x9fe72885, 0xae36bfb5, 0x82c1fcad);  
+    u = u * mult;  
+    u ^= u.wxyz ^ u >> 13;  
+    uint r = dot(u, mult);  
+    r ^= r >> 11;  
+    r = (r * r) ^ r;  
+    return r * 2.3283064365386962890625e-10;  
+  }
+  float fade(float t) {
+    return t * t * t * (t * (t * 6 - 15) + 10);
+  }
+  float lerp2(float t, float a, float b){
+    return a + t * (b - a);
+  }
+  float grad(float hash, float x, float y, float z){
+    int h = ((int)(hash*16))&0xF; //hash*16を16で割った余りで勾配ベクトルを決定
+    switch (h) {
+      case 0x0: return x + y;
+      case 0x1: return -x + y;
+      case 0x2: return x - y;
+      case 0x3: return -x - y;
+      case 0x4: return x + z;
+      case 0x5: return -x + z;
+      case 0x6: return x - z;
+      case 0x7: return -x - z;
+      case 0x8: return y + z;
+      case 0x9: return -y + z;
+      case 0xA: return y - z;
+      case 0xB: return -y - z;
+      case 0xC: return y + x;
+      case 0xD: return -y + z;
+      case 0xE: return y - x;
+      case 0xF: return -y - z;
+      default: return 0; // 発生しない
+    }
+  }
+  float perlinNoise(float3 p) {
+    int3 Pi = floor(p);
+    int3 succPi = floor(float3(Pi.x+1, Pi.y+1, Pi.z+1)); // ループさせるために、整数座標の次の点をループ幅で割った余りにする
+    float3 Pf = float3(p-Pi); // 小数部分
+    float3 Pfm1 = Pf - 1.0;
+    float3 fadePf = float3(fade(Pf.x), fade(Pf.y), fade(Pf.z));
+    uint s = (uint)seed;
+    float A = ibukiHash(uint4(Pi.x    , Pi.y    , Pi.z    , s));
+    float B = ibukiHash(uint4(succPi.x, Pi.y    , Pi.z    , s));
+    float C = ibukiHash(uint4(Pi.x    , succPi.y, Pi.z    , s));
+    float D = ibukiHash(uint4(succPi.x, succPi.y, Pi.z    , s));
+    float E = ibukiHash(uint4(Pi.x    , Pi.y    , succPi.z, s));
+    float F = ibukiHash(uint4(succPi.x, Pi.y    , succPi.z, s));
+    float G = ibukiHash(uint4(Pi.x    , succPi.y, succPi.z, s));
+    float H = ibukiHash(uint4(succPi.x, succPi.y, succPi.z, s));
+
+    float AB = lerp2(fadePf.x, grad(A, Pf.x, Pf.y, Pf.z), 
+                              grad(B, Pfm1.x, Pf.y, Pf.z));
+    float CD = lerp2(fadePf.x, grad(C, Pf.x, Pfm1.y, Pf.z), 
+                              grad(D, Pfm1.x, Pfm1.y, Pf.z));
+    float EF = lerp2(fadePf.x, grad(E, Pf.x, Pf.y, Pfm1.z), 
+                              grad(F, Pfm1.x, Pf.y, Pfm1.z));
+    float GH = lerp2(fadePf.x, grad(G, Pf.x, Pfm1.y, Pfm1.z), 
+                              grad(H, Pfm1.x, Pfm1.y, Pfm1.z));
+    float ABCD = lerp2(fadePf.y, AB, CD);
+    float EFGH = lerp2(fadePf.y, EF, GH);
+    return (lerp2(fadePf.z, ABCD, EFGH)+1.0)/2.0; // 結果を0〜1に正規化
+  }
+
+  float3 hash33(float3 p) {
+    float n = sin(dot(p, float3(12.79+seed*0.01213455, 19.33+seed*0.01151236, 237.77+seed*0.00015123)));
+    return frac(float3(8.140132238, 37.521047, 32.287531) * n) * 2.0 - 1.0;
+  } 
+
+  float tetraNoise(float3 p) {
+    float3 i = floor(p + dot(p, float3(1.0/3.0, 1.0/3.0, 1.0/3.0)));
+    p -= i - dot(i, float3(1.0/6.0, 1.0/6.0, 1.0/6.0));
+    float3 i1 = step(p.yzx, p);
+    float3 i2 = max(i1, 1.0 - i1.zxy);
+    i1 = min(i1, 1.0 - i1.zxy);
+    float3 p1 = p - i1 + 1.0/6.0;
+    float3 p2 = p - i2 + 1.0/3.0;
+    float3 p3 = p - 0.5;
+    float4 v = max(0.5 - float4(dot(p,p), dot(p1,p1), dot(p2,p2), dot(p3,p3)), 0.0);
+    float4 d = float4(
+      dot(p,  hash33(i)),
+      dot(p1, hash33(i + i1)),
+      dot(p2, hash33(i + i2)),
+      dot(p3, hash33(i + 1.0))
+    );
+    return clamp(dot(d, v*v*v*8.0) * 1.732 + 0.5, 0.0, 1.0);
+  }
+
+  // 可変オクターブ数のfBm。濃度/滑らかさパラメータで制御される
+  float fbmN(float3 p) {
+    int oct = max((int)octaves, 1);
+    float n = 0.0, sum = 0.0, a = 1.0;
+    float3 offs = float3(0.0, 0.23, 0.07);
+    [loop] for (int i = 0; i < oct; i++) {
+      n += tetraNoise(p * exp2(float(i)) + offs.x) * a;
+      sum += a;
+      a *= persistence;
+      offs = offs.yzx;
+    }
+    return n / max(sum, 1e-5);
+  }
+
+  // フロー関数(球面風歪み + 時間進行)。回転は事前にuva側で適用済み
+  float flowFunc(float3 p, float t) {
+    p.z -= dot(p, p) * pow(abs(scaleN),1.1) * roundness;
+    p.z += 0.15 * t;
+    return fbmN(p * 1.5);
+  }
+
+  // ピクセルUVを変換後ノイズ座標へ
+  float2 toNoiseCoord(float2 uv, float aspectRatio) {
+    // 中央寄せ&アスペクト補正
+    float2 p = (uv - 0.5) * float2(aspectRatio, 1.0);
+    // 回転
+    float cr = cos(rotationRad), sr = sin(rotationRad);
+    p = float2(p.x * cr - p.y * sr, p.x * sr + p.y * cr);
+    // 位置オフセット(pxを高さで正規化)
+    p -= float2(offsetX, offsetY) / objW;
+    // スケール
+    p /= scaleN;
+    // ドリフト(速度*方向*time、ノイズ単位)
+    p += float2(driftX, driftY);
+    return p;
+  }
+
+  float4 curlNoise(PS_INPUT input) : SV_Target {
+    float2 uv = input.uv;
+    float aspectRatio = objW / objH;
+    float2 uva = toNoiseCoord(uv, aspectRatio);
+
+    // カール: フロー関数のXY勾配の直交ベクトル(中心差分)
+    float e = 0.005;
+    float dx = (flowFunc(float3(uva.x + e, uva.y, 0.0), morphT)
+              - flowFunc(float3(uva.x - e, uva.y, 0.0), morphT)) / (2.0 * e);
+    float dy = (flowFunc(float3(uva.x, uva.y + e, 0.0), morphT)
+              - flowFunc(float3(uva.x, uva.y - e, 0.0), morphT)) / (2.0 * e);
+    float2 curl = float2(dy, -dx);
+
+    // 渦巻き+進化の回転をカールベクトルに適用
+    float cs = cos(curlRotRad), sn = sin(curlRotRad);
+    curl = float2(curl.x * cs - curl.y * sn, curl.x * sn + curl.y * cs);
+
+    // バイアス: 水平/垂直方向のcurl強度倍率
+    curl.x *= biasX;
+    curl.y *= biasY;
+
+    // 前フレーム結果(tex=object=putpixeldataで復元済み)をカール方向に変位した位置からサンプル
+    float2 uvDisp = uv + curl * displacement * float2(1.0 / aspectRatio, 1.0);
+    float3 val = tex.Sample(samLinear, uvDisp).rgb;
+
+    // 新カラーパターン(ユーザー指定のモノクロ版)
+    //float snNs = dot(sin(uv * 8.0 - cos(uv.yx * 12.0 + s0 + seed*123.456)), float2(0.25, 0.25)) + 0.5;
+    float snNs = perlinNoise(float3(uva.x, uva.y, s0 + seed*123.456));
+    float col1 = 0.5 + 0.5 * cos(3.0 + snNs * 6.2831);
+
+    // フロー陰影(変位前位置で評価することで陰影が静止する)
+    col1 *= flowFunc(float3(uva, 0.0), morphT+seed) * 2.0 - 0.5;
+
+    // ポストプロセス(新サンプル側のみに適用、フィードバックには蓄積させない)
+    col1 = saturate(col1);
+    // フローの柔らかさ: コントラスト
+    col1 = saturate((col1 - 0.5) * softnessGain + 0.5);
+    // エッジ定義: smoothstepで線形→急峻化を補間
+    float ew = 0.5 * (1.0 - edgeDef01);
+    float lo = clamp(0.5 - ew, 0.0, 0.5);
+    float hi = clamp(0.5 + ew, 0.5, 1.0);
+    float sharp = (hi - lo > 0.001) ? smoothstep(lo, hi, col1) : (col1 >= 0.5 ? 1.0 : 0.0);
+    col1 = lerp(col1, sharp, edgeDef01);
+    // フロー減衰: 低周波ノイズで非一様変調
+    if (falloffN > 0.001) {
+      float modn = fbmN(float3(uva * 0.3, morphT * 0.5));
+      modn = lerp(1.0, modn, falloffN);
+      col1 *= modn;
+    }
+    col1 = saturate(col1);
+
+    float3 col = float3(col1, col1, col1);
+
+    // 前フレームとの混合 (初回フレームのみスキップ)
+    if (isFirstFrame < 0.5) {
+      col = lerp(val, col, invN);
+    }
+    col = max(col, 0.0);
+    return float4(col, 1.0);
+  }
+]]
+
+-- 時刻に依存しないパラメータを事前計算(反復ループの外で1回だけ)
+local scaleN = scale / 100
+local rotationRad = math.rad(rotation)
+local curlRotRad = math.rad(swirl)
+
+-- 濃度→オクターブ数(-100→1, 0→3, 100→6)
+local octaves = math.floor(3 + density / 40 + 0.5)
+if octaves < 1 then octaves = 1 end
+if octaves > 6 then octaves = 6 end
+
+-- 滑らかさ→persistence(0→0.7=粗い, 50→0.5=v6既定, 100→0.3=滑らか)
+local persistence = 0.7 - (smoothness / 100) * 0.4
+
+-- バイアス→curl成分の倍率(50で(1,1)中立、0で(2,0.5)水平強、100で(0.5,2)垂直強)
+local k = (bias - 50) / 50
+local biasX = math.pow(2, -k)
+local biasY = math.pow(2, k)
+
+-- サンプルの半径→変位量(radius=100で本家の0.006、200で2倍)
+local displacement = 0.006 * (radius / 100)
+local invN = 1.0 / samples
+
+-- ポストプロセス係数
+local softnessGain = 1.0 + (softness / 100) * 3.0
+local edgeDef01 = edgeDef / 100
+local falloffN = flowFalloff / 100
+
+-- 反復計算の起点を決定
+-- 前回フレームが現在より「前」かつサイズ一致なら、前フレームを復元してそこから再開
+-- 後方シーク(前回 >= 現在)・サイズ変更・初回はフレーム0から再計算してシーク時も連続再生と同じ結果に
+local startFrame
+local hasInitialState
+if lastFrameImg ~= nil and lastFrame ~= nil
+   and lastFrameImg_w == obj.w and lastFrameImg_h == obj.h
+   and lastFrame < obj.frame + t0 then
+  obj.putpixeldata("object", lastFrameImg, lastFrameImg_w, lastFrameImg_h)
+  startFrame = lastFrame + 1
+  hasInitialState = true
+else
+  startFrame = 0
+  hasInitialState = false
+end
+
+-- startFrameから現在フレームまでフィードバックを内部反復で蓄積
+for f = startFrame, obj.frame + t0 do
+  local t = f / obj.framerate
+  local morphT = (turbVel / 100) * t
+  local driftX = (velocityX / 100) * t
+  local driftY = (velocityY / 100) * t
+
+  -- 初回フレーム判定: 復元した初期状態がある場合は常に0、無い場合はf=0の時だけ1
+  local isFirstFrame
+  if hasInitialState then
+    isFirstFrame = 0
+  else
+    if f == 0 then
+      isFirstFrame = 1
+    else
+      isFirstFrame = 0
+    end
+  end
+
+  obj.pixelshader("curlNoise", "object", "object", {
+    obj.w,
+    obj.h,
+    morphT,
+    driftX,
+    driftY,
+    scaleN,
+    roundness/100,
+    offsetX,
+    offsetY,
+    rotationRad,
+    curlRotRad,
+    octaves,
+    persistence,
+    biasX,
+    biasY,
+    displacement,
+    invN,
+    softnessGain,
+    edgeDef01,
+    falloffN,
+    seed,
+    s0,
+    isFirstFrame
+  }, "copy")
+end
+
+-- 次フレーム用に状態を保存
+lastFrameImg, lastFrameImg_w, lastFrameImg_h = obj.getpixeldata("object")
+lastFrame = obj.frame + t0
