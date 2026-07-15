@@ -2,8 +2,8 @@
 --information:パーリンノイズ@noise_Te v1.0 by teruyoshi | 指定されたオブジェクトにx,y,tでループ可能(シームレス)なパーリンノイズを適用します
 --group:基本設定,true
 --track@str:強さ,0,100,100,0.01
---track@velocityX:速度X,-800,800,0,0.01
---track@velocityY:速度Y,-800,800,0,0.01
+--track@velocityX:速度X,-4000,4000,0,0.01
+--track@velocityY:速度Y,-4000,4000,0,0.01
 --track@changeRate:変化速度,0,800,1,0.01
 --track@divX:分割数X,0,2000,5,1
 --track@divY:分割数Y,0,2000,5,1
@@ -616,7 +616,7 @@ for i=1,depth do
 end
 
 @カールノイズ
---information:カールノイズ@noise_Te v1.0 by teruyoshi | 指定されたオブジェクトにカールノイズ(渦巻き状の流体模様)を適用します
+--information:カールノイズ@noise_Te v1.1 by teruyoshi | 指定されたオブジェクトにカールノイズ(渦巻き状の流体模様)を適用します
 --group:入力ノイズ,true
 --track@velocityX:速度X,-800,800,0,0.01 -- ノイズの流れる速度X
 --track@velocityY:速度Y,-800,800,0,0.01 -- ノイズの流れる速度Y
@@ -900,11 +900,14 @@ local falloffN = flowFalloff / 100
 -- 後方シーク(前回 >= 現在)・サイズ変更・初回はフレーム0から再計算してシーク時も連続再生と同じ結果に
 local startFrame
 local hasInitialState
-if lastFrameImg ~= nil and lastFrame ~= nil
-   and lastFrameImg_w == obj.w and lastFrameImg_h == obj.h
-   and lastFrame < obj.frame + t0 then
-  obj.putpixeldata("object", lastFrameImg, lastFrameImg_w, lastFrameImg_h)
-  startFrame = lastFrame + 1
+local id = obj.effect_id
+if lastFrameImg ~= nil and lastFrameImg[id] ~= nil
+   and lastFrame ~= nil and lastFrame[id] ~= nil
+   and lastFrameImg_w ~= nil and lastFrameImg_w[id] == obj.w
+   and lastFrameImg_h ~= nil and lastFrameImg_h[id] == obj.h
+   and lastFrame[id] < obj.frame + t0 then
+  obj.putpixeldata("object", lastFrameImg[id], lastFrameImg_w[id], lastFrameImg_h[id])
+  startFrame = lastFrame[id] + 1
   hasInitialState = true
 else
   startFrame = 0
@@ -958,5 +961,9 @@ for f = startFrame, obj.frame + t0 do
 end
 
 -- 次フレーム用に状態を保存
-lastFrameImg, lastFrameImg_w, lastFrameImg_h = obj.getpixeldata("object")
-lastFrame = obj.frame + t0
+if lastFrameImg == nil then lastFrameImg = {} end
+if lastFrameImg_w == nil then lastFrameImg_w = {} end
+if lastFrameImg_h == nil then lastFrameImg_h = {} end
+if lastFrame == nil then lastFrame = {} end
+lastFrameImg[id], lastFrameImg_w[id], lastFrameImg_h[id] = obj.getpixeldata("object")
+lastFrame[id] = obj.frame + t0
