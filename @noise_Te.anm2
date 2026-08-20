@@ -1,3 +1,452 @@
+@ブルーノイズ
+--information:ブルーノイズ@noise_Te v1.1 by teruyoshi | 指定されたオブジェクトにブルーノイズ(FFTハイパスフィルタによる粒の偏りが少ない均一な砂目状ノイズ)を適用します
+--group:基本設定,true
+--track@str:強さ,0,100,100,0.01
+--track@offsetX:位置X,-2000,2000,0,0.01
+--track@offsetY:位置Y,-2000,2000,0,0.01
+--track@rotation:回転,-360,360,0,0.01
+--track@sizeX:ドットサイズX,1,200,10,0.01
+--track@sizeY:ドットサイズY,1,200,10,0.01
+--track@threshold:しきい値,0,100,0,0.01
+--track@thresholdSoftness:しきい値の滑らかさ,0,100,0,0.01
+--check@invert:反転,0
+--group:その他の設定,false
+--check@dependLayer:レイヤーごとに乱数を変える,1
+--track@seed:シード,0,10000,0,1
+--track@bnSize:タイルサイズ,4,64,32,1 -- ブルーノイズ生成時に使うキャッシュのサイズ　2^nを超える度に約2倍重くなる。
+--track@lowCut:低周波カット,0,100,25,0.1 -- ハイパスフィルタでどこまでの低周波を除去するか(ナイキスト周波数に対する割合%)
+--select@blendMode:合成モード,アルファ値と乗算=0,明るさと乗算=1,明るさと乗算(RGB別)=2,輝度と乗算=3,ディザ加算=4,ディザ加算(RGB別)=5
+
+--filter
+
+--[[pixelshader@blueNoise:
+  // ノイズ値の計算を行い、obj.w*obj.h個ぶんの値をキャッシュバッファに書き込む。
+  static const uint MAX_BN_SIZE = 64;
+  static const uint MAX_BN_N = 4096;   // MAX_BN_SIZE*MAX_BN_SIZE
+  static const uint MAX_BN_VEC = 1024; // MAX_BN_N/4個のfloat4にパックする
+  Texture2D tex : register(t0);
+  cbuffer constant0 : register(b0) {
+    float offsetX;
+    float offsetY;
+    float rotCos;
+    float rotSin;
+    float sizeX;
+    float sizeY;
+    float threshold;
+    float thresholdSoftness;
+    float invertFlag;
+    float seed;
+    float rgbIndependentFlag;
+    // RGB別モードでG,Bチャンネルを読み出す位置のオフセット
+    float shiftGX;
+    float shiftGY;
+    float shiftBX;
+    float shiftBY;
+    float objWidth;
+    float objHeight;
+    float bnSize;
+    float4 bnTile[MAX_BN_VEC];
+  };
+  struct PS_INPUT {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+  };
+
+  float ibukiHash(uint4 u) {
+    // posとseedをもとに、0〜1の疑似乱数を生成
+    const uint4 mult = uint4(0xae3cc725, 0x9fe72885, 0xae36bfb5, 0x82c1fcad);
+    u = u * mult;
+    u ^= u.wxyz ^ u >> 13;
+    uint r = dot(u, mult);
+    r ^= r >> 11;
+    r = (r * r) ^ r;
+    return r * 2.3283064365386962890625e-10;
+  }
+
+  // bnTileからidx番目の値を取り出す
+  float bnTileAt(uint idx) {
+    float4 v = bnTile[idx / 4u];
+    uint c = idx % 4u;
+    return c == 0u ? v.x : c == 1u ? v.y : c == 2u ? v.z : v.w;
+  }
+
+  // 反転・しきい値を適用する。
+  float shapeNoise(float raw) {
+    float v = raw;
+    if (invertFlag > 0.5) v = 1.0 - v; // 反転
+    float halfWidth = max(thresholdSoftness * 0.5, 1e-5); // 0除算防止
+    return v * smoothstep(threshold - halfWidth, threshold + halfWidth, v);
+  }
+
+  float4 blueNoise(PS_INPUT input) : SV_Target {
+    uint bnSizeU = (uint)round(bnSize);
+    int bnSizeI = (int)bnSizeU;
+
+    // 回転・拡大縮小の中心をオブジェクト中心に揃えるため、オブジェクトの半幅・半高をあらかじめ引く。
+    float lx = input.pos.x - objWidth * 0.5;
+    float ly = input.pos.y - objHeight * 0.5;
+    float px = (lx * rotCos - ly * rotSin) + offsetX;
+    float py = (lx * rotSin + ly * rotCos) + offsetY;
+
+    int cx = (int)floor(px / sizeX);
+    int cy = (int)floor(py / sizeY);
+
+    // どのタイルの何番目のコピーかを求める
+    int tileX = (int)floor((float)cx / (float)bnSizeI);
+    int tileY = (int)floor((float)cy / (float)bnSizeI);
+    int localX = cx - tileX * bnSizeI; // 0..bnSizeI-1
+    int localY = cy - tileY * bnSizeI;
+
+    // タイルの反復コピーごとにランダムな量だけ参照位置を巡回シフトすることで、
+    // タイルの単純な繰り返しによるループ感を目立ちにくくする。
+    float hx = ibukiHash(uint4((uint)(tileX + 100000), (uint)(tileY + 100000), 0, (uint)seed));
+    float hy = ibukiHash(uint4((uint)(tileX + 100000), (uint)(tileY + 100000), 1, (uint)seed));
+    int shiftX = (int)(hx * bnSizeU);
+    int shiftY = (int)(hy * bnSizeU);
+    uint ucx = (uint)(localX + shiftX) % bnSizeU;
+    uint ucy = (uint)(localY + shiftY) % bnSizeU;
+
+    float nR = shapeNoise(bnTileAt(ucy * bnSizeU + ucx));
+
+    // 合成モードがRGB別の場合、G,Bチャンネルを同じタイルから
+    // シード由来の固定オフセットだけずらして読み、3枚別々にタイルを持たずに安価にRGB独立っぽい見た目にする
+    float nG = nR;
+    float nB = nR;
+    if (rgbIndependentFlag > 0.5) {
+      uint ucxG = (uint)(localX + shiftX + (int)shiftGX) % bnSizeU;
+      uint ucyG = (uint)(localY + shiftY + (int)shiftGY) % bnSizeU;
+      uint ucxB = (uint)(localX + shiftX + (int)shiftBX) % bnSizeU;
+      uint ucyB = (uint)(localY + shiftY + (int)shiftBY) % bnSizeU;
+      nG = shapeNoise(bnTileAt(ucyG * bnSizeU + ucxG));
+      nB = shapeNoise(bnTileAt(ucyB * bnSizeU + ucxB));
+    }
+
+    return float4(nR, nG, nB, 1.0);
+  }
+]]
+
+--[[pixelshader@blend:
+  // ノイズ層(t1)と元画像(t0)を選んだ合成モードで合成する。
+  Texture2D base : register(t0);
+  Texture2D merge : register(t1);
+  cbuffer constant0 : register(b0) {
+    float str;
+    float blendMode;
+  };
+  SamplerState samLinear : register(s0);
+  struct PS_INPUT {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+  };
+
+  float4 rgb2hsl(float4 rgba) {
+    float r = rgba.r;
+    float g = rgba.g;
+    float b = rgba.b;
+    float maxc = max(r, max(g, b));
+    float minc = min(r, min(g, b));
+    float h = 0.0;
+    float s = 0.0;
+    float l = (maxc + minc) / 2.0;
+    if (maxc != minc) {
+      float delta = maxc - minc;
+      if (l < 0.5) s = delta / (maxc + minc);
+      else s = delta / (2.0 - maxc - minc);
+      if (maxc == r) h = (g - b) / delta + (g < b ? 6.0 : 0.0);
+      else if (maxc == g) h = (b - r) / delta + 2.0;
+      else h = (r - g) / delta + 4.0;
+      h /= 6.0;
+    }
+    return float4(h, s, l, rgba.w);
+  }
+  float4 hsl2rgb(float4 hsla) {
+    float r = abs(hsla.x * 6.0 - 3.0) - 1.0;
+    float g = 2.0 - abs(hsla.x * 6.0 - 2.0);
+    float b = 2.0 - abs(hsla.x * 6.0 - 4.0);
+    float C = (1.0 - abs(2.0 * hsla.z - 1.0)) * hsla.y;
+    return float4((float3(r, g, b) - 0.5) * C + hsla.z, hsla.w);
+  }
+
+  float4 blend(PS_INPUT input) : SV_Target {
+    float4 baseColor = base.Sample(samLinear, input.uv);
+    float3 n = merge.Sample(samLinear, input.uv).rgb;
+
+    if (blendMode == 3) {
+      // 輝度と乗算: 色相・彩度(H,S)は元画像のまま保ち、輝度にノイズ値を乗算する。
+      float3 straightRgb = baseColor.rgb / (baseColor.a + 1e-10);
+      float4 hslBase = rgb2hsl(float4(straightRgb, baseColor.a));
+      float mergeL = n.r;
+      float mix = mergeL * str + (1 - str);
+      float newL = hslBase.z * mix;
+      float4 resultStraight = hsl2rgb(float4(hslBase.x, hslBase.y, newL, baseColor.a));
+      return float4(resultStraight.rgb * baseColor.a, baseColor.a);
+    }
+
+    if (blendMode == 4 || blendMode == 5) {
+      // ディザ加算: 元の色に-0.5〜0.5の範囲でノイズを加算する。
+      float3 add = (n - 0.5) * str;
+      return float4(baseColor.rgb + add, baseColor.a);
+    }
+
+    // 0:アルファ値と乗算 / 1,2:明るさと乗算
+    float3 mixRGB = n * str + (1 - str);
+    float outAlpha = (blendMode == 0) ? baseColor.a * mixRGB.x : baseColor.a;
+    return float4(baseColor.rgb * mixRGB, outAlpha);
+  }
+]]
+
+-- ブルーノイズタイルをFFTで生成する
+local MAX_BN_SIZE = 64 -- 上のシェーダー側のMAX_BN_SIZEと同じ値にすること
+local MAX_BN_N = MAX_BN_SIZE * MAX_BN_SIZE
+local BN_SIZE = math.floor(bnSize)
+local BN_N = BN_SIZE * BN_SIZE
+
+-- ホワイトノイズを周波数領域に変換し、低周波成分をカットしてから逆変換することでブルーノイズを生成する。
+-- iの上位bitsビットを反転した値の対応表を作る
+local function bitReverseTable(n, bits)
+  local rev = {}
+  for i = 0, n - 1 do
+    local r, x = 0, i
+    for _ = 1, bits do
+      r = r * 2 + (x % 2)
+      x = math.floor(x / 2)
+    end
+    rev[i] = r
+  end
+  return rev
+end
+
+-- サイズnの1次元FFTに必要な回転因子(twiddle factor)e^(±2πik/n)をk=0..n/2-1ぶん1回だけ事前計算してテーブル化する。
+-- 参考: luafft (https://github.com/h4rm/luafft, MIT License, Copyright (c) 2011 Benjamin von Ardenne)
+local function twiddleTable(n, invert)
+  local tRe, tIm = {}, {}
+  local sign = invert and 1 or -1
+  for k = 0, n / 2 - 1 do
+    local ang = sign * 2 * math.pi * k / n
+    tRe[k] = math.cos(ang)
+    tIm[k] = math.sin(ang)
+  end
+  return tRe, tIm
+end
+
+-- 1次元FFT(反復版Cooley-Tukey)。re,imを直接書き換える。twRe,twIm(サイズn用に事前計算した
+-- ものをinvertに応じて渡す)。
+local function fft1d(re, im, n, bits, rev, twRe, twIm, invert)
+  for i = 0, n - 1 do
+    local j = rev[i]
+    if j > i then
+      re[i], re[j] = re[j], re[i]
+      im[i], im[j] = im[j], im[i]
+    end
+  end
+  local len = 2
+  while len <= n do
+    local half = len / 2
+    local stride = n / len
+    local i = 0
+    while i < n do
+      local ti = 0
+      for k = 0, half - 1 do
+        local a, b = i + k, i + k + half
+        local wRe, wIm = twRe[ti], twIm[ti]
+        local vRe = re[b] * wRe - im[b] * wIm
+        local vIm = re[b] * wIm + im[b] * wRe
+        local uRe, uIm = re[a], im[a]
+        re[a] = uRe + vRe
+        im[a] = uIm + vIm
+        re[b] = uRe - vRe
+        im[b] = uIm - vIm
+        ti = ti + stride
+      end
+      i = i + len
+    end
+    len = len * 2
+  end
+  if invert then
+    for i = 0, n - 1 do
+      re[i] = re[i] / n
+      im[i] = im[i] / n
+    end
+  end
+end
+
+-- n以上で最小の2の累乗を返す
+local function nextPow2(n)
+  local p = 1
+  while p < n do p = p * 2 end
+  return p
+end
+
+local function buildBlueNoiseTile(bnSeed)
+  math.randomseed(bnSeed + 12345 * obj.layer * dependLayer) -- dependLayer=1ならレイヤーごとに乱数を変える
+
+  local fftSize = nextPow2(BN_SIZE)
+  local fftN = fftSize * fftSize
+
+  local bits, nn = 0, fftSize
+  while nn > 1 do
+    nn = nn / 2
+    bits = bits + 1
+  end
+  local rev = bitReverseTable(fftSize, bits)
+
+  -- 順変換用・逆変換用のtwiddleテーブルをそれぞれ1回だけ事前計算し、行・列の全FFT呼び出しで使い回す
+  local fwdTwRe, fwdTwIm = twiddleTable(fftSize, false)
+  local invTwRe, invTwIm = twiddleTable(fftSize, true)
+
+  -- ホワイトノイズを生成
+  local re, im = {}, {}
+  for i = 0, fftN - 1 do
+    re[i] = math.random()
+    im[i] = 0.0
+  end
+
+  -- 分離型2次元FFT: 行方向→列方向の順に1次元FFTを適用する
+  local tmpRe, tmpIm = {}, {}
+  local function transformRows(invert)
+    local twRe, twIm = invert and invTwRe or fwdTwRe, invert and invTwIm or fwdTwIm
+    for y = 0, fftSize - 1 do
+      local base = y * fftSize
+      for x = 0, fftSize - 1 do
+        tmpRe[x] = re[base + x]
+        tmpIm[x] = im[base + x]
+      end
+      fft1d(tmpRe, tmpIm, fftSize, bits, rev, twRe, twIm, invert)
+      for x = 0, fftSize - 1 do
+        re[base + x] = tmpRe[x]
+        im[base + x] = tmpIm[x]
+      end
+    end
+  end
+  local function transformCols(invert)
+    local twRe, twIm = invert and invTwRe or fwdTwRe, invert and invTwIm or fwdTwIm
+    for x = 0, fftSize - 1 do
+      for y = 0, fftSize - 1 do
+        tmpRe[y] = re[y * fftSize + x]
+        tmpIm[y] = im[y * fftSize + x]
+      end
+      fft1d(tmpRe, tmpIm, fftSize, bits, rev, twRe, twIm, invert)
+      for y = 0, fftSize - 1 do
+        re[y * fftSize + x] = tmpRe[y]
+        im[y * fftSize + x] = tmpIm[y]
+      end
+    end
+  end
+
+  transformRows(false)
+  transformCols(false)
+
+  -- 低周波成分(直流付近)を除去するハイパスフィルタ
+  -- カットオフ半径はナイキスト周波数(fftSize/2)に対するlowCut(%)の割合で決める。
+  -- 0%なら何も除去しないホワイトノイズになる
+  local cutoff = (fftSize / 2) * (lowCut / 100.0)
+  for v = 0, fftSize - 1 do
+    local fv = v
+    if fv > fftSize / 2 then fv = fv - fftSize end
+    for u = 0, fftSize - 1 do
+      local fu = u
+      if fu > fftSize / 2 then fu = fu - fftSize end
+      if math.sqrt(fu * fu + fv * fv) < cutoff then
+        local idx = v * fftSize + u
+        re[idx] = 0.0
+        im[idx] = 0.0
+      end
+    end
+  end
+
+  transformCols(true)
+  transformRows(true)
+
+  -- fftSize四方の結果からBN_SIZE四方(左上)だけを切り出す。
+  -- 切り出した範囲だけで改めて順位付けすることで、0〜1・値の重複なしという性質を切り出し後のBN_SIZE四方の中でも保証する
+  local cropped = {}
+  for y = 0, BN_SIZE - 1 do
+    for x = 0, BN_SIZE - 1 do
+      cropped[y * BN_SIZE + x] = re[y * fftSize + x]
+    end
+  end
+
+  local order = {}
+  for i = 0, BN_N - 1 do order[i + 1] = i end
+  table.sort(order, function(a, b) return cropped[a] < cropped[b] end)
+
+  local tile = {}
+  for rankIdx = 0, BN_N - 1 do
+    local cellIdx = order[rankIdx + 1]
+    tile[cellIdx + 1] = rankIdx / (BN_N - 1)
+  end
+  return tile
+end
+
+-- 同じシード・タイル解像度・低周波カット量のタイルはフレームをまたいで再利用する
+if blueNoiseCache == nil then blueNoiseCache = {} end
+local bnSeed = math.floor(seed)
+if blueNoiseCache.seed ~= bnSeed or blueNoiseCache.bnSize ~= BN_SIZE or blueNoiseCache.lowCut ~= lowCut or (dependLayer == 1 and blueNoiseCache.layer ~= obj.layer) then
+  blueNoiseCache.seed = bnSeed
+  blueNoiseCache.bnSize = BN_SIZE
+  blueNoiseCache.lowCut = lowCut
+  blueNoiseCache.layer = obj.layer
+
+  -- ブルーノイズタイルを生成し、MAX_BN_N個のfloat4にパックする。BN_SIZE*BN_SIZEより大きい部分は0埋めする。
+  local rawTile = buildBlueNoiseTile(bnSeed)
+  local paddedTile = {}
+  for i = 1, BN_N do paddedTile[i] = rawTile[i] end
+  for i = BN_N + 1, MAX_BN_N do paddedTile[i] = 0 end
+  blueNoiseCache.tile = paddedTile
+
+  -- タイルコピーの継ぎ目(BN_SIZEセルごと)は隣接ピクセルが独立な値になり局所的なコントラストが
+  -- 安定しないが、位置がトラックバー値だけで決まると常に同じ画素位置に現れてしまう。
+  -- シードごとにドットサイズ単位でランダムな変位を加え、継ぎ目の位置自体をばらつかせる。
+  blueNoiseCache.shiftCellsX = math.random(0, BN_SIZE - 1)
+  blueNoiseCache.shiftCellsY = math.random(0, BN_SIZE - 1)
+
+  -- RGB別モードでG,Bチャンネルを読み出す位置のオフセット
+  blueNoiseCache.shiftGX = math.random(0, BN_SIZE - 1)
+  blueNoiseCache.shiftGY = math.random(0, BN_SIZE - 1)
+  blueNoiseCache.shiftBX = math.random(0, BN_SIZE - 1)
+  blueNoiseCache.shiftBY = math.random(0, BN_SIZE - 1)
+end
+
+local rgbIndependent = 0
+if blendMode == 2 or blendMode == 5 then
+  rgbIndependent = 1
+end
+
+-- 回転角のcos/sinは全ピクセルで共通の値なのでLua側で1回だけ計算して渡す
+local rotRad = math.rad(rotation)
+local rotCos = math.cos(rotRad)
+local rotSin = math.sin(rotRad)
+
+-- ノイズ値(obj.w*obj.h個)だけをtempbufferに書き込む。
+obj.setoption("drawtarget", "tempbuffer", obj.w, obj.h)
+obj.pixelshader("blueNoise", "tempbuffer", "object", {
+  offsetX + blueNoiseCache.shiftCellsX * sizeX,
+  offsetY + blueNoiseCache.shiftCellsY * sizeY,
+  rotCos,
+  rotSin,
+  sizeX,
+  sizeY,
+  threshold/100,
+  thresholdSoftness/100,
+  invert,
+  bnSeed,
+  rgbIndependent,
+  blueNoiseCache.shiftGX,
+  blueNoiseCache.shiftGY,
+  blueNoiseCache.shiftBX,
+  blueNoiseCache.shiftBY,
+  obj.w,
+  obj.h,
+  BN_SIZE,
+  unpack(blueNoiseCache.tile)
+}, "copy")
+
+-- 元画像("object")とノイズ(tempbuffer)を選んだ合成モードでブレンドする
+obj.pixelshader("blend", "object", {"object", "tempbuffer"}, {
+  str/100.0,
+  blendMode
+}, "copy")
+
 @パーリンノイズ
 --information:パーリンノイズ@noise_Te v1.0 by teruyoshi | 指定されたオブジェクトにx,y,tでループ可能(シームレス)なパーリンノイズを適用します
 --group:基本設定,true
